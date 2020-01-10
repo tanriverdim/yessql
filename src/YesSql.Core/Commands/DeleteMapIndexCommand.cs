@@ -1,12 +1,12 @@
-﻿using Dapper;
+using Dapper;
+using Microsoft.Extensions.Logging;
 using System;
-using System.Data;
+using System.Data.Common;
 using System.Threading.Tasks;
-using YesSql.Sql;
 
 namespace YesSql.Commands
 {
-    public class DeleteMapIndexCommand : IIndexCommand
+    public sealed class DeleteMapIndexCommand : IIndexCommand
     {
         private readonly int _documentId;
         private readonly Type _indexType;
@@ -21,9 +21,11 @@ namespace YesSql.Commands
             _tablePrefix = tablePrefix;
         }
 
-        public virtual Task ExecuteAsync(IDbConnection connection, IDbTransaction transaction, ISqlDialect dialect)
+        public Task ExecuteAsync(DbConnection connection, DbTransaction transaction, ISqlDialect dialect, ILogger logger )
         {
-            return connection.ExecuteAsync("delete from " + dialect.QuoteForTableName(_tablePrefix + _indexType.Name) + " where " + dialect.QuoteForColumnName("DocumentId") + " = @Id", new { Id = _documentId }, transaction);
+            var command = "delete from " + dialect.QuoteForTableName(_tablePrefix + _indexType.Name) + " where " + dialect.QuoteForColumnName("DocumentId") + " = @Id";
+            logger.LogTrace(command);
+            return connection.ExecuteAsync(command, new { Id = _documentId }, transaction);
         }
     }
 }

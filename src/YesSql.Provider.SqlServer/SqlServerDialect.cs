@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Text;
 using YesSql.Sql;
 
 namespace YesSql.Provider.SqlServer
@@ -24,9 +25,9 @@ namespace YesSql.Provider.SqlServer
             {DbType.Int16, "SMALLINT"},
             {DbType.UInt16, "SMALLINT"},
             {DbType.Int32, "INT"},
-            {DbType.UInt32, "INT"},
+            {DbType.UInt32, "BIGINT"},
             {DbType.Int64, "BIGINT"},
-            {DbType.UInt64, "BIGINT"},
+            {DbType.UInt64, "NUMERIC(20)"},
             {DbType.Single, "REAL"},
             {DbType.AnsiStringFixedLength, "CHAR(255)"},
             {DbType.AnsiString, "VARCHAR(255)"},
@@ -49,11 +50,6 @@ namespace YesSql.Provider.SqlServer
         public override string Name => "SqlServer";
         public override string IdentitySelectString => "; select SCOPE_IDENTITY()";
 
-        public override ISqlBuilder CreateBuilder(string tablePrefix)
-        {
-            return new SqlServerSqlBuilder(tablePrefix, this);
-        }
-
         public override string GetTypeName(DbType dbType, int? length, byte precision, byte scale)
         {
             if (length.HasValue)
@@ -62,17 +58,17 @@ namespace YesSql.Provider.SqlServer
                 {
                     if (dbType == DbType.String)
                     {
-                        return "NTEXT";
+                        return "NVARCHAR(max)";
                     }
 
                     if (dbType == DbType.AnsiString)
                     {
-                        return "TEXT";
+                        return "VARCHAR(max)";
                     }
 
                     if (dbType == DbType.Binary)
                     {
-                        return "BLOB";
+                        return "VARBINARY(max)";
                     }
                 }
                 else
@@ -102,19 +98,33 @@ namespace YesSql.Provider.SqlServer
             throw new Exception("DbType not found for: " + dbType);
         }
 
-        public override void Page(ISqlBuilder sqlBuilder, int offset, int limit)
+        public override void Page(ISqlBuilder sqlBuilder, string offset, string limit)
         {
-            if (offset == 0 && limit != 0)
+            if (offset != null)
             {
-                // Insert LIMIT clause after the select
-                var selector = sqlBuilder.GetSelector();
-                selector = " TOP " + limit + " " + selector;
-                sqlBuilder.Selector(selector);
+                sqlBuilder.Trail(" OFFSET ");
+                sqlBuilder.Trail(offset);
+                sqlBuilder.Trail(" ROWS");
+
+                if (limit != null)
+                {
+                    sqlBuilder.Trail(" FETCH NEXT ");
+                    sqlBuilder.Trail(limit);
+                    sqlBuilder.Trail(" ROWS ONLY");
+                }
             }
-            else if (offset != 0 || limit != 0)
+            else if (limit != null)
             {
-                sqlBuilder.Trail = "OFFSET " + offset + " ROWS FETCH FIRST " + limit + " ROWS ONLY";
+                // Insert LIMIT clause after the select with brackets for parameters
+                sqlBuilder.InsertSelector(" ");
+                sqlBuilder.InsertSelector("(" + limit + ")");
+                sqlBuilder.InsertSelector("TOP ");
             }
+        }
+
+        public override string GetDropIndexString(string indexName, string tableName)
+        {
+            return "drop index if exists " + QuoteForColumnName(indexName) + " on " + QuoteForTableName(tableName);
         }
 
         public override string QuoteForColumnName(string columnName)
@@ -127,9 +137,21 @@ namespace YesSql.Provider.SqlServer
             return "[" + tableName + "]";
         }
 
-        protected override string Quote(string value)
+        public override void Concat(StringBuilder builder, params Action<StringBuilder>[] generators)
         {
-            return QuoteString + value.Replace(QuoteString, DoubleQuoteString) + QuoteString;
+            builder.Append("(");
+
+            for (var i = 0; i < generators.Length; i++)
+            {
+                if (i > 0)
+                {
+                    builder.Append(" + ");
+                }
+
+                generators[i](builder);
+            }
+
+            builder.Append(")");
         }
     }
 }

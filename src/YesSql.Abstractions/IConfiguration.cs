@@ -1,3 +1,6 @@
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
 
@@ -9,8 +12,12 @@ namespace YesSql
         IsolationLevel IsolationLevel { get; set; }
         IConnectionFactory ConnectionFactory { get; set; }
         IContentSerializer ContentSerializer { get; set; }
+        IIdGenerator IdGenerator { get; set; }
+        ILogger Logger { get; set; }
         string TablePrefix { get; set; }
         int SessionPoolSize { get; set; }
+        bool QueryGatingEnabled { get; set; }
+        HashSet<Type> ConcurrentTypes { get; }
     }
 
     public static class ConfigurationExtensions
@@ -50,77 +57,51 @@ namespace YesSql
             configuration.SessionPoolSize = size;
             return configuration;
         }
+
+        public static IConfiguration DisableQueryGating(this IConfiguration configuration)
+        {
+            configuration.QueryGatingEnabled = false;
+            return configuration;
+        }
+
+        public static IConfiguration UseLogger(this IConfiguration configuration, ILogger logger)
+        {
+            configuration.Logger = logger;
+            return configuration;
+        }
+
+        public static IConfiguration CheckConcurrentUpdates(this IConfiguration configuration, Type type)
+        {
+            configuration.ConcurrentTypes.Add(type);
+            return configuration;
+        }
+
+        public static IConfiguration CheckConcurrentUpdates<T>(this IConfiguration configuration)
+        {
+            return CheckConcurrentUpdates(configuration, typeof(T));
+        }
     }
 
     public class DbConnectionFactory<TDbConnection> : IConnectionFactory
         where TDbConnection : DbConnection, new()
     {
-        private readonly bool _shareConnection;
-        private TDbConnection _sharedConnection;
         private readonly string _connectionString;
-        private bool _disposing;
 
-        public DbConnectionFactory(string connectionString, bool shareConnection = false)
+        public Type DbConnectionType => typeof(TDbConnection);
+
+        public DbConnectionFactory(string connectionString)
         {
-            _shareConnection = shareConnection;
             _connectionString = connectionString;
         }
 
-        public IDbConnection CreateConnection()
+        public DbConnection CreateConnection()
         {
-            if (_shareConnection)
+            var connection = new TDbConnection
             {
-                if (_sharedConnection == null)
-                {
-                    lock (this)
-                    {
-                        if (_sharedConnection == null)
-                        {
-                            _sharedConnection = new TDbConnection();
-                            _sharedConnection.ConnectionString = _connectionString;
-                        }
-                    }
-                }
-
-                return _sharedConnection;
-            }
-
-            var connection = new TDbConnection();
-            connection.ConnectionString = _connectionString;
+                ConnectionString = _connectionString
+            };
 
             return connection;
-        }
-
-        public void CloseConnection(IDbConnection connection)
-        {
-            if (_shareConnection)
-            {
-                // If the connection is shared, we don't close it
-                return;
-            }
-
-            if (connection != null)
-            {
-                connection.Close();
-            }
-        }
-
-        public void Dispose()
-        {
-            if (_disposing)
-            {
-                return;
-            }
-
-            _disposing = true;
-
-            if (_shareConnection)
-            {
-                if (_sharedConnection != null)
-                {
-                    _sharedConnection.Dispose();
-                }
-            }
         }
     }
 }

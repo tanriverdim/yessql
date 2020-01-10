@@ -1,8 +1,13 @@
-image: Visual Studio 2017
+image: Visual Studio 2019
+skip_branch_with_pr: true
+branches:
+  only:
+    - master
+    - dev
 init:
   - git config --global core.autocrlf true
 services:
-  - mssql2016
+  - mssql2017
   - mysql
   - postgresql96
 install:
@@ -10,11 +15,9 @@ install:
   - ps: $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = true
   - ps: $env:NUGET_XMLDOC_MODE = "skip"
   - ps: $env:DOTNET_CLI_TELEMETRY_OPTOUT = 1
+  - ps: Start-FileDownload 'https://dist.nuget.org/win-x86-commandline/latest/nuget.exe'
 build_script:
   - dotnet --version
-  - dotnet restore
-  - dotnet build -c Release
-  - dotnet pack -c Release
 before_test:
   - SET SQLSERVER_CONNECTION_STRING=Data Source=.;Initial Catalog=tempdb;Integrated Security=True
   - SET MYSQL_CONNECTION_STRING=server=localhost;uid=root;pwd=Password12!;database=yessql;
@@ -30,17 +33,26 @@ test_script:
   - dotnet test .\test\YesSql.Tests\YesSql.Tests.csproj --filter "FullyQualifiedName~YesSql.Tests.SqlServerTests" --configuration Release
   - dotnet test .\test\YesSql.Tests\YesSql.Tests.csproj --filter "FullyQualifiedName~YesSql.Tests.MySqlTests" --configuration Release
   - dotnet test .\test\YesSql.Tests\YesSql.Tests.csproj --filter "FullyQualifiedName~YesSql.Tests.SqliteTests" --configuration Release
-  - dotnet test .\test\YesSql.Tests\YesSql.Tests.csproj --filter "FullyQualifiedName~YesSql.Tests.InMemoryTests" --configuration Release
   - dotnet test .\test\YesSql.Tests\YesSql.Tests.csproj --filter "FullyQualifiedName~YesSql.Tests.PostgreSqlTests" --configuration Release
   - dotnet test .\test\YesSql.Tests\YesSql.Tests.csproj --filter "FullyQualifiedName~YesSql.Tests.ProviderTests" --configuration Release
+after_test:
+  - dotnet pack -c Release
 artifacts:
 - path: 'src\**\*.nupkg'
-deploy:
-  on:
-    branch: master
-  provider: NuGet
-  server: https://www.nuget.org/api/v2/package
-  api_key:
-    secure: s7HNYfyvnQGOhEPcs8cBm5zF8pOeBe6JzGkpONPGhRPsXSqYSDCj8D4XaT3VzvMo
-  skip_symbols: true
-  artifact: /.*\.nupkg/
+
+deploy:  
+  - provider: NuGet
+    on:
+      branch: dev
+    server: https://www.myget.org/F/yessql/api/v2/package
+    api_key:
+      secure: 7PQvuxXn5P39X5QDlDKWbNpOKJKivpqkq7umakIirAZ12CSTAiCwjtJhSBGVboPm
+    skip_symbols: true
+    artifact: /.*\.nupkg/
+  - provider: NuGet
+    on:
+      branch: master
+    server: https://www.nuget.org/api/v2/package
+    api_key:
+      secure: SisppZdqLVAtsU40MxI5gqe8Uzz4U0SwWMgg7G2os5x2m6nZiWBF8svdOP5sQsCk
+    skip_symbols: true

@@ -1,57 +1,54 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Data;
 using Dapper;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Data.Common;
 using YesSql.Collections;
 using YesSql.Sql.Schema;
 
 namespace YesSql.Sql
 {
-    public class SchemaBuilder
+    public class SchemaBuilder : ISchemaBuilder
     {
         private ICommandInterpreter _builder;
-        private string _tablePrefix;
-        private ISqlDialect _dialect;
-        public IDbConnection Connection { get; private set; }
-        public IDbTransaction Transaction { get; private set; }
+        private readonly ILogger _logger;
+
+        public string TablePrefix { get; private set; }
+        public ISqlDialect Dialect { get; private set; }
+        public DbConnection Connection { get; private set; }
+        public DbTransaction Transaction { get; private set; }
         public bool ThrowOnError { get; set; } = true;
 
-        public SchemaBuilder(ISession session)
+        public SchemaBuilder(IConfiguration configuration, DbTransaction transaction, bool throwOnError = true)
         {
-            Transaction = session.Demand();
+            Transaction = transaction;
+            _logger = configuration.Logger;
             Connection = Transaction.Connection;
             _builder = CommandInterpreterFactory.For(Connection);
-            _dialect = SqlDialectFactory.For(Connection);
-            _tablePrefix = session.Store.Configuration.TablePrefix;
-        }
-
-        public SchemaBuilder(IDbConnection connection, IDbTransaction transaction, string tablePrefix)
-        {
-            _builder = CommandInterpreterFactory.For(connection);
-            _dialect = SqlDialectFactory.For(connection);
-            _tablePrefix = tablePrefix;
-            Connection = connection;
-            Transaction = transaction;
+            Dialect = SqlDialectFactory.For(configuration.ConnectionFactory.DbConnectionType);
+            TablePrefix = configuration.TablePrefix;
+            ThrowOnError = throwOnError;
         }
 
         private void Execute(IEnumerable<string> statements)
         {
             foreach (var statement in statements)
             {
+                _logger.LogTrace(statement);
                 Connection.Execute(statement, null, Transaction);
             }
         }
 
-        private string FormatTable(string table)
+        private string Prefix(string table)
         {
-            return _tablePrefix + table;
+            return TablePrefix + table;
         }
 
-        public SchemaBuilder CreateMapIndexTable(string name, Action<CreateTableCommand> table)
+        public ISchemaBuilder CreateMapIndexTable(string name, Action<ICreateTableCommand> table)
         {
             try
             {
-                var createTable = new CreateTableCommand(FormatTable(name));
+                var createTable = new CreateTableCommand(Prefix(name));
                 var collection = CollectionHelper.Current;
                 var documentTable = collection.GetPrefixedName(Store.DocumentTable);
 
@@ -75,11 +72,11 @@ namespace YesSql.Sql
             return this;
         }
 
-        public SchemaBuilder CreateReduceIndexTable(string name, Action<CreateTableCommand> table)
+        public ISchemaBuilder CreateReduceIndexTable(string name, Action<ICreateTableCommand> table)
         {
             try
             {
-                var createTable = new CreateTableCommand(FormatTable(name));
+                var createTable = new CreateTableCommand(Prefix(name));
                 var collection = CollectionHelper.Current;
                 var documentTable = collection.GetPrefixedName(Store.DocumentTable);
 
@@ -111,7 +108,7 @@ namespace YesSql.Sql
             return this;
         }
 
-        public SchemaBuilder DropReduceIndexTable(string name)
+        public ISchemaBuilder DropReduceIndexTable(string name)
         {
             try
             {
@@ -120,7 +117,7 @@ namespace YesSql.Sql
 
                 var bridgeTableName = name + "_" + documentTable;
 
-                if (String.IsNullOrEmpty(_dialect.CascadeConstraintsString))
+                if (String.IsNullOrEmpty(Dialect.CascadeConstraintsString))
                 {
                     DropForeignKey(bridgeTableName, "FK_" + bridgeTableName + "_Id");
                     DropForeignKey(bridgeTableName, "FK_" + bridgeTableName + "_DocumentId");
@@ -140,11 +137,11 @@ namespace YesSql.Sql
             return this;
         }
 
-        public SchemaBuilder DropMapIndexTable(string name)
+        public ISchemaBuilder DropMapIndexTable(string name)
         {
             try
             {
-                if (String.IsNullOrEmpty(_dialect.CascadeConstraintsString))
+                if (String.IsNullOrEmpty(Dialect.CascadeConstraintsString))
                 {
                     DropForeignKey(name, "FK_" + name);
                 }
@@ -162,11 +159,11 @@ namespace YesSql.Sql
             return this;
         }
 
-        public SchemaBuilder CreateTable(string name, Action<CreateTableCommand> table)
+        public ISchemaBuilder CreateTable(string name, Action<ICreateTableCommand> table)
         {
             try
             {
-                var createTable = new CreateTableCommand(FormatTable(name));
+                var createTable = new CreateTableCommand(Prefix(name));
                 table(createTable);
                 Execute(_builder.CreateSql(createTable));
             }
@@ -181,11 +178,11 @@ namespace YesSql.Sql
             return this;
         }
 
-        public SchemaBuilder AlterTable(string name, Action<AlterTableCommand> table)
+        public ISchemaBuilder AlterTable(string name, Action<IAlterTableCommand> table)
         {
             try
             {
-                var alterTable = new AlterTableCommand(FormatTable(name));
+                var alterTable = new AlterTableCommand(Prefix(name), Dialect, TablePrefix);
                 table(alterTable);
                 Execute(_builder.CreateSql(alterTable));
             }
@@ -200,11 +197,11 @@ namespace YesSql.Sql
             return this;
         }
 
-        public SchemaBuilder DropTable(string name)
+        public ISchemaBuilder DropTable(string name)
         {
             try
             {
-                var deleteTable = new DropTableCommand(FormatTable(name));
+                var deleteTable = new DropTableCommand(Prefix(name));
                 Execute(_builder.CreateSql(deleteTable));
             }
             catch
@@ -218,11 +215,11 @@ namespace YesSql.Sql
             return this;
         }
 
-        public SchemaBuilder CreateForeignKey(string name, string srcTable, string[] srcColumns, string destTable, string[] destColumns)
+        public ISchemaBuilder CreateForeignKey(string name, string srcTable, string[] srcColumns, string destTable, string[] destColumns)
         {
             try
             {
-                var command = new CreateForeignKeyCommand(FormatTable(name), FormatTable(srcTable), srcColumns, FormatTable(destTable), destColumns);
+                var command = new CreateForeignKeyCommand(Prefix(name), Prefix(srcTable), srcColumns, Prefix(destTable), destColumns);
                 Execute(_builder.CreateSql(command));
             }
             catch
@@ -236,11 +233,11 @@ namespace YesSql.Sql
             return this;
         }
 
-        public SchemaBuilder CreateForeignKey(string name, string srcModule, string srcTable, string[] srcColumns, string destTable, string[] destColumns)
+        public ISchemaBuilder CreateForeignKey(string name, string srcModule, string srcTable, string[] srcColumns, string destTable, string[] destColumns)
         {
             try
             {
-                var command = new CreateForeignKeyCommand(FormatTable(name), FormatTable(srcTable), srcColumns, FormatTable(destTable), destColumns);
+                var command = new CreateForeignKeyCommand(Prefix(name), Prefix(srcTable), srcColumns, Prefix(destTable), destColumns);
                 Execute(_builder.CreateSql(command));
             }
             catch
@@ -253,11 +250,11 @@ namespace YesSql.Sql
             return this;
         }
 
-        public SchemaBuilder CreateForeignKey(string name, string srcTable, string[] srcColumns, string destModule, string destTable, string[] destColumns)
+        public ISchemaBuilder CreateForeignKey(string name, string srcTable, string[] srcColumns, string destModule, string destTable, string[] destColumns)
         {
             try
             {
-                var command = new CreateForeignKeyCommand(FormatTable(name), FormatTable(srcTable), srcColumns, FormatTable(destTable), destColumns);
+                var command = new CreateForeignKeyCommand(Prefix(name), Prefix(srcTable), srcColumns, Prefix(destTable), destColumns);
                 Execute(_builder.CreateSql(command));
 
             }
@@ -272,11 +269,11 @@ namespace YesSql.Sql
             return this;
         }
 
-        public SchemaBuilder CreateForeignKey(string name, string srcModule, string srcTable, string[] srcColumns, string destModule, string destTable, string[] destColumns)
+        public ISchemaBuilder CreateForeignKey(string name, string srcModule, string srcTable, string[] srcColumns, string destModule, string destTable, string[] destColumns)
         {
             try
             {
-                var command = new CreateForeignKeyCommand(FormatTable(name), FormatTable(srcTable), srcColumns, FormatTable(destTable), destColumns);
+                var command = new CreateForeignKeyCommand(Prefix(name), Prefix(srcTable), srcColumns, Prefix(destTable), destColumns);
                 Execute(_builder.CreateSql(command));
             }
             catch
@@ -290,11 +287,11 @@ namespace YesSql.Sql
             return this;
         }
 
-        public SchemaBuilder DropForeignKey(string srcTable, string name)
+        public ISchemaBuilder DropForeignKey(string srcTable, string name)
         {
             try
             {
-                var command = new DropForeignKeyCommand(FormatTable(srcTable), name);
+                var command = new DropForeignKeyCommand(Prefix(srcTable), Prefix(name));
                 Execute(_builder.CreateSql(command));
             }
             catch

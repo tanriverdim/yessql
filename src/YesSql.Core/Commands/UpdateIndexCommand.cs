@@ -1,6 +1,7 @@
 using Dapper;
+using Microsoft.Extensions.Logging;
 using System.Collections.Generic;
-using System.Data;
+using System.Data.Common;
 using System.Linq;
 using System.Threading.Tasks;
 using YesSql.Collections;
@@ -8,7 +9,7 @@ using YesSql.Indexes;
 
 namespace YesSql.Commands
 {
-    public class UpdateIndexCommand : IndexCommand
+    public sealed class UpdateIndexCommand : IndexCommand
     {
         private readonly IEnumerable<int> _addedDocumentIds;
         private readonly IEnumerable<int> _deletedDocumentIds;
@@ -25,11 +26,12 @@ namespace YesSql.Commands
             _deletedDocumentIds = deletedDocumentIds;
         }
 
-        public override async Task ExecuteAsync(IDbConnection connection, IDbTransaction transaction, ISqlDialect dialect)
+        public override async Task ExecuteAsync(DbConnection connection, DbTransaction transaction, ISqlDialect dialect, ILogger logger)
         {
             var type = Index.GetType();
 
             var sql = Updates(type, dialect);
+            logger.LogTrace(sql);
             await connection.ExecuteAsync(sql, Index, transaction);
 
             // Update the documents list
@@ -41,10 +43,12 @@ namespace YesSql.Commands
                 var bridgeSqlAdd = "insert into " + dialect.QuoteForTableName(_tablePrefix + bridgeTableName) + " (" + columnList + ") values (@Id, @DocumentId);";
                 var bridgeSqlRemove = "delete from " + dialect.QuoteForTableName(_tablePrefix + bridgeTableName) + " where " + dialect.QuoteForColumnName("DocumentId") + " = @DocumentId and " + dialect.QuoteForColumnName(type.Name + "Id") + " = @Id;";
 
+                logger.LogTrace(bridgeSqlAdd);
                 await connection.ExecuteAsync(bridgeSqlAdd, _addedDocumentIds.Select(x => new { DocumentId = x, Id = Index.Id }), transaction);
+
+                logger.LogTrace(bridgeSqlRemove);
                 await connection.ExecuteAsync(bridgeSqlRemove, _deletedDocumentIds.Select(x => new { DocumentId = x, Id = Index.Id }), transaction);
             }
         }
-
     }
 }

@@ -1,14 +1,12 @@
-﻿using System.Data;
-using System.Threading.Tasks;
 using Dapper;
+using Microsoft.Extensions.Logging;
+using System.Data.Common;
+using System.Threading.Tasks;
 using YesSql.Collections;
-using YesSql.Indexes;
-using YesSql.Services;
-using YesSql.Sql;
 
 namespace YesSql.Commands
 {
-    public class DeleteDocumentCommand : DocumentCommand
+    public sealed class DeleteDocumentCommand : DocumentCommand
     {
         private readonly string _tablePrefix;
         public override int ExecutionOrder { get; } = 4;
@@ -18,10 +16,11 @@ namespace YesSql.Commands
             _tablePrefix = tablePrefix;
         }
 
-        public override Task ExecuteAsync(IDbConnection connection, IDbTransaction transaction, ISqlDialect dialect)
+        public override Task ExecuteAsync(DbConnection connection, DbTransaction transaction, ISqlDialect dialect, ILogger logger)
         {
             var documentTable = CollectionHelper.Current.GetPrefixedName(Store.DocumentTable);
             var deleteCmd = "delete from " + dialect.QuoteForTableName(_tablePrefix + documentTable) + " where " + dialect.QuoteForColumnName("Id") + " = @Id;";
+            logger.LogTrace(deleteCmd);
             return connection.ExecuteAsync(deleteCmd, Document, transaction);
         }
     }

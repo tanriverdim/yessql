@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Data;
 
@@ -9,6 +9,7 @@ namespace YesSql.Sql.Schema
         private static Dictionary<Type, DbType> DbTypes = new Dictionary<Type, DbType>
         {
             { typeof(object), DbType.Binary },
+            { typeof(byte[]), DbType.Binary },
             { typeof(string), DbType.String },
             { typeof(char), DbType.String },
             { typeof(bool), DbType.Boolean },
@@ -35,6 +36,17 @@ namespace YesSql.Sql.Schema
             if (DbTypes.TryGetValue(type, out dbType))
             {
                 return dbType;
+            }
+
+            // Nullable<T> ?
+            if (type.GetGenericTypeDefinition() == typeof(Nullable<>))
+            {
+                var nullable = Nullable.GetUnderlyingType(type);
+
+                if (nullable != null)
+                {
+                    return ToDbType(nullable);
+                }
             }
 
             return DbType.Object;

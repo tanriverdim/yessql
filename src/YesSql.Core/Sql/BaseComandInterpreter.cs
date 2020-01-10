@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Linq;
@@ -112,13 +112,12 @@ namespace YesSql.Sql
                 yield break;
             }
 
-            var commands = new List<string>();
-
             // drop columns
             foreach (var dropColumn in command.TableCommands.OfType<DropColumnCommand>())
             {
                 var builder = new StringBuilder();
                 Run(builder, dropColumn);
+                yield return builder.ToString();
             }
 
             // add columns
@@ -134,6 +133,14 @@ namespace YesSql.Sql
             {
                 var builder = new StringBuilder();
                 Run(builder, alterColumn);
+                yield return builder.ToString();
+            }
+
+            // rename columns
+            foreach (var renameColumn in command.TableCommands.OfType<RenameColumnCommand>())
+            {
+                var builder = new StringBuilder();
+                Run(builder, renameColumn);
                 yield return builder.ToString();
             }
 
@@ -193,6 +200,15 @@ namespace YesSql.Sql
             }
         }
 
+        public virtual void Run(StringBuilder builder, IRenameColumnCommand command)
+        {
+            builder.AppendFormat("alter table {0} rename column {1} to {2}",
+                _dialect.QuoteForTableName(command.Name),
+                _dialect.QuoteForColumnName(command.ColumnName),
+                _dialect.QuoteForColumnName(command.NewColumnName)
+                );
+        }
+
         public virtual void Run(StringBuilder builder, IAddIndexCommand command)
         {
             builder.AppendFormat("create index {1} on {0} ({2}) ",
@@ -203,9 +219,7 @@ namespace YesSql.Sql
 
         public virtual void Run(StringBuilder builder, IDropIndexCommand command)
         {
-            builder.AppendFormat("drop index {0} ON {1}",
-                _dialect.QuoteForColumnName(command.IndexName),
-                _dialect.QuoteForTableName(command.Name));
+            builder.Append(_dialect.GetDropIndexString(command.IndexName, command.Name));
         }
 
         public virtual IEnumerable<string> Run(ISqlStatementCommand command)

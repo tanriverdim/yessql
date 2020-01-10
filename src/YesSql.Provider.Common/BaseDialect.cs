@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Data;
 using System.Globalization;
 using System.Text;
+using YesSql.Sql;
 
 namespace YesSql.Provider
 {
@@ -11,7 +12,8 @@ namespace YesSql.Provider
         public Dictionary<string, ISqlFunction> Methods = new Dictionary<string, ISqlFunction>(StringComparer.OrdinalIgnoreCase);
 
         public abstract string Name { get; }
-        public virtual string InOperator(string values) {
+        public virtual string InOperator(string values)
+        {
             if (values.StartsWith("@") && !values.Contains(","))
             {
                 return " IN " + values;
@@ -21,6 +23,22 @@ namespace YesSql.Provider
                 return " IN (" + values + ") ";
             }
         }
+
+        public virtual string NotInOperator(string values)
+        {
+            return " NOT" + InOperator(values);
+        }
+
+        public virtual string InSelectOperator(string values)
+        {
+            return " IN (" + values + ") ";
+        }
+
+        public virtual string NotInSelectOperator(string values)
+        {
+            return " NOT IN (" + values + ") ";
+        }
+
         public virtual string CreateTableString => "create table";
 
         public virtual bool HasDataTypeInIdentityColumn => false;
@@ -44,7 +62,9 @@ namespace YesSql.Provider
             var res = new StringBuilder(200);
 
             if (SupportsForeignKeyConstraintInAlterTable)
+            {
                 res.Append(" add");
+            }
 
             res.Append(" constraint ")
                 .Append(name)
@@ -85,9 +105,10 @@ namespace YesSql.Provider
             {
                 sb.Append(" if exists");
             }
+
             return sb.ToString();
         }
-
+        public abstract string GetDropIndexString(string indexName, string tableName);
         public abstract string QuoteForColumnName(string columnName);
         public abstract string QuoteForTableName(string tableName);
 
@@ -98,7 +119,13 @@ namespace YesSql.Provider
 
         public virtual string DefaultValuesInsert => "DEFAULT VALUES";
 
-        protected abstract string Quote(string value);
+        public virtual bool PrefixIndex => false;
+
+        protected virtual string Quote(string value)
+        {
+            return SingleQuoteString + value.Replace(SingleQuoteString, DoubleSingleQuoteString) + SingleQuoteString;
+        }
+
         public abstract string GetTypeName(DbType dbType, int? length, byte precision, byte scale);
 
         public virtual string GetSqlValue(object value)
@@ -134,8 +161,11 @@ namespace YesSql.Provider
             return "null";
         }
 
-        public abstract void Page(ISqlBuilder sqlBuilder, int offset, int limit);
-        public abstract ISqlBuilder CreateBuilder(string tablePrefix);
+        public abstract void Page(ISqlBuilder sqlBuilder, string offset, string limit);
+        public virtual ISqlBuilder CreateBuilder(string tablePrefix)
+        {
+            return new SqlBuilder(tablePrefix, this);
+        }
 
         public string RenderMethod(string name, string[] args)
         {
@@ -144,7 +174,43 @@ namespace YesSql.Provider
                 return method.Render(args);
             }
 
-            return name + "(" + String.Join(", ", args) +  ")";
+            return name + "(" + String.Join(", ", args) + ")";
+        }
+
+        public virtual void Concat(StringBuilder builder, params Action<StringBuilder>[] generators)
+        {
+            builder.Append("(");
+
+            for (var i = 0; i < generators.Length; i++)
+            {
+                if (i > 0)
+                {
+                    builder.Append(" || ");
+                }
+
+                generators[i](builder);
+            }
+
+            builder.Append(")");
+        }
+
+        public virtual List<string> GetDistinctOrderBySelectString(List<string> select, List<string> orderBy)
+        {
+            // Most databases requires all ordered fields to be part of the select when DISTINCT is used
+
+            foreach (var o in orderBy)
+            {
+                var trimmed = o.Trim();
+
+                // Each order segment can be a field name, or a punctuation, so we filter out the punctuations 
+                if (trimmed != "," && trimmed != "DESC" && trimmed != "ASC" && !select.Contains(o))
+                {
+                    select.Add(",");
+                    select.Add(o);
+                }
+            }
+
+            return select;
         }
     }
 }

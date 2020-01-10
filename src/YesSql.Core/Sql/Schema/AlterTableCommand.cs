@@ -1,13 +1,18 @@
-﻿using System;
+using System;
 using System.Data;
 
 namespace YesSql.Sql.Schema
 {
     public class AlterTableCommand : SchemaCommand, IAlterTableCommand
     {
-        public AlterTableCommand(string name)
+        private readonly ISqlDialect _dialect;
+        private readonly string _tablePrefix;
+
+        public AlterTableCommand(string name, ISqlDialect dialect, string tablePrefix)
             : base(name, SchemaCommandType.AlterTable)
         {
+            _dialect = dialect;
+            _tablePrefix = tablePrefix;
         }
 
         public void AddColumn(string columnName, DbType dbType, Action<IAddColumnCommand> column = null)
@@ -41,14 +46,32 @@ namespace YesSql.Sql.Schema
             TableCommands.Add(command);
         }
 
+        public void RenameColumn(string columnName, string newColumnName)
+        {
+            var command = new RenameColumnCommand(Name, columnName, newColumnName);
+
+            TableCommands.Add(command);
+        }
+
+
         public void CreateIndex(string indexName, params string[] columnNames)
         {
+            if (_dialect.PrefixIndex)
+            {
+                indexName = _tablePrefix + indexName;
+            }
+
             var command = new AddIndexCommand(Name, indexName, columnNames);
             TableCommands.Add(command);
         }
 
         public void DropIndex(string indexName)
         {
+            if (_dialect.PrefixIndex)
+            {
+                indexName = _tablePrefix + indexName;
+            }
+
             var command = new DropIndexCommand(Name, indexName);
             TableCommands.Add(command);
         }

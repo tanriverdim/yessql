@@ -1,30 +1,60 @@
 using Dapper;
+using Microsoft.Extensions.Logging;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Data;
+using System.Data.Common;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
 using YesSql.Collections;
+using YesSql.Data;
 using YesSql.Indexes;
-using YesSql.Serialization;
 
 namespace YesSql.Services
 {
+    public class QueryState
+    {
+        public QueryState(ISqlBuilder sqlBuilder)
+        {
+            _documentTable = CollectionHelper.Current.GetPrefixedName(Store.DocumentTable);
+            _sqlBuilder = sqlBuilder;
+        }
+
+        public List<Type> _bound = new List<Type>();
+        public readonly string _documentTable;
+        public string _lastParameterName;
+        public ISqlBuilder _sqlBuilder;
+        public List<Action<object, ISqlBuilder>> _parameterBindings;
+        public StringBuilder _builder = new StringBuilder();
+
+        public QueryState Clone()
+        {
+            var clone = new QueryState(_sqlBuilder.Clone());
+
+            clone._bound = new List<Type>(_bound);
+            clone._lastParameterName = _lastParameterName;
+            clone._parameterBindings = _parameterBindings == null ? null : new List<Action<object, ISqlBuilder>>(_parameterBindings);
+            clone._builder = new StringBuilder(_builder.ToString());
+
+            // Clear previous paging if any
+            clone._sqlBuilder.ClearTrail();
+            clone._sqlBuilder.Skip(null);
+            clone._sqlBuilder.Take(null);
+
+            return clone;
+        }
+    }
+
     public class DefaultQuery : IQuery
     {
+        internal QueryState _queryState;
         private readonly Session _session;
-
-        private List<Type> _bound = new List<Type>();
-        private readonly string _documentTable;
-        private readonly IDbConnection _connection;
         private readonly ISqlDialect _dialect;
-        private readonly IDbTransaction _transaction;
-        private string _lastParameterName;
-        private ISqlBuilder _sqlBuilder;
-        private StringBuilder _builder = new StringBuilder();
+        private object _compiledQuery = null;
 
         public static Dictionary<MethodInfo, Action<DefaultQuery, StringBuilder, ISqlDialect, MethodCallExpression>> MethodMappings =
             new Dictionary<MethodInfo, Action<DefaultQuery, StringBuilder, ISqlDialect, MethodCallExpression>>();
@@ -37,8 +67,8 @@ namespace YesSql.Services
                 query.ConvertFragment(builder, expression.Object);
                 builder.Append(" like ");
                 query.ConvertFragment(builder, expression.Arguments[0]);
-                var parameter = query._sqlBuilder.Parameters[query._lastParameterName];
-                query._sqlBuilder.Parameters[query._lastParameterName] = parameter.ToString() + "%";
+                var parameter = query._queryState._sqlBuilder.Parameters[query._queryState._lastParameterName];
+                query._queryState._sqlBuilder.Parameters[query._queryState._lastParameterName] = parameter.ToString() + "%";
                 builder.Append(")");
             };
 
@@ -48,8 +78,8 @@ namespace YesSql.Services
                 query.ConvertFragment(builder, expression.Object);
                 builder.Append(" like ");
                 query.ConvertFragment(builder, expression.Arguments[0]);
-                var parameter = query._sqlBuilder.Parameters[query._lastParameterName];
-                query._sqlBuilder.Parameters[query._lastParameterName] = "%" + parameter.ToString();
+                var parameter = query._queryState._sqlBuilder.Parameters[query._queryState._lastParameterName];
+                query._queryState._sqlBuilder.Parameters[query._queryState._lastParameterName] = "%" + parameter.ToString();
                 builder.Append(")");
 
             };
@@ -60,22 +90,44 @@ namespace YesSql.Services
                 query.ConvertFragment(builder, expression.Object);
                 builder.Append(" like ");
                 query.ConvertFragment(builder, expression.Arguments[0]);
-                var parameter = query._sqlBuilder.Parameters[query._lastParameterName];
-                query._sqlBuilder.Parameters[query._lastParameterName] = "%" + parameter.ToString() + "%";
+                var parameter = query._queryState._sqlBuilder.Parameters[query._queryState._lastParameterName];
+                query._queryState._sqlBuilder.Parameters[query._queryState._lastParameterName] = "%" + parameter.ToString() + "%";
                 builder.Append(")");
             };
 
-            MethodMappings[typeof(DefaultQueryExtensions).GetMethod("IsIn", new Type[] { typeof(string), typeof(IEnumerable<string>) })] =
-            MethodMappings[typeof(DefaultQueryExtensions).GetMethod("IsIn", new Type[] { typeof(int), typeof(IEnumerable<int>) })] =
+            MethodMappings[typeof(String).GetMethod(nameof(String.Concat), new Type[] { typeof(string[]) })] =
+            MethodMappings[typeof(String).GetMethod(nameof(String.Concat), new Type[] { typeof(string), typeof(string) })] =
+            MethodMappings[typeof(String).GetMethod(nameof(String.Concat), new Type[] { typeof(string), typeof(string), typeof(string) })] =
+            MethodMappings[typeof(String).GetMethod(nameof(String.Concat), new Type[] { typeof(string), typeof(string), typeof(string), typeof(string) })] =
+                (query, builder, dialect, expression) =>
+            {
+                var generators = new List<Action<StringBuilder>>();
+
+                foreach (var argument in expression.Arguments)
+                {
+                    generators.Add(sb => query.ConvertFragment(sb, argument));
+                }
+
+                dialect.Concat(builder, generators.ToArray());
+            };
+
+            MethodMappings[typeof(DefaultQueryExtensions).GetMethod("IsIn")] =
                 (query, builder, dialect, expression) =>
                 {
-                    var values = (Expression.Lambda(expression.Arguments[1]).Compile().DynamicInvoke() as IEnumerable<object>).ToArray();
+                    // Could be simplified if int[] could be casted to IEnumerable<object>
+                    var objects = Expression.Lambda(expression.Arguments[1]).Compile().DynamicInvoke() as IEnumerable;
+                    var values = new List<object>();
 
-                    if (values.Length == 0)
+                    foreach(var o in objects)
+                    {
+                        values.Add(o);
+                    }
+
+                    if (values.Count == 0)
                     {
                         builder.Append(" 1 = 0");
                     }
-                    else if (values.Length == 1)
+                    else if (values.Count == 1)
                     {
                         query.ConvertFragment(builder, expression.Arguments[0]);
                         builder.Append(" = " );
@@ -85,10 +137,10 @@ namespace YesSql.Services
                     {
                         query.ConvertFragment(builder, expression.Arguments[0]);
                         var elements = new StringBuilder();
-                        for (var i = 0; i < values.Length; i++)
+                        for (var i = 0; i < values.Count; i++)
                         {
                             query.ConvertFragment(elements, Expression.Constant(values[i]));
-                            if (i < values.Length - 1)
+                            if (i < values.Count - 1)
                             {
                                 elements.Append(", ");
                             }
@@ -97,68 +149,186 @@ namespace YesSql.Services
                         builder.Append(dialect.InOperator(elements.ToString()));
                     }
                 };
+
+            MethodMappings[typeof(DefaultQueryExtensions).GetMethod("IsNotIn")] =
+                (query, builder, dialect, expression) =>
+                {
+                    // Could be simplified if int[] could be casted to IEnumerable<object>
+                    var objects = Expression.Lambda(expression.Arguments[1]).Compile().DynamicInvoke() as IEnumerable;
+                    var values = new List<object>();
+
+                    foreach (var o in objects)
+                    {
+                        values.Add(o);
+                    }
+
+                    if (values.Count == 0)
+                    {
+                        builder.Append(" 1 = 1");
+                    }
+                    else if (values.Count == 1)
+                    {
+                        query.ConvertFragment(builder, expression.Arguments[0]);
+                        builder.Append(" <> ");
+                        query.ConvertFragment(builder, Expression.Constant(values[0]));
+                    }
+                    else
+                    {
+                        query.ConvertFragment(builder, expression.Arguments[0]);
+                        var elements = new StringBuilder();
+                        for (var i = 0; i < values.Count; i++)
+                        {
+                            query.ConvertFragment(elements, Expression.Constant(values[i]));
+                            if (i < values.Count - 1)
+                            {
+                                elements.Append(", ");
+                            }
+                        }
+
+                        builder.Append(dialect.NotInOperator(elements.ToString()));
+                    }
+                };
+
+            MethodMappings[typeof(DefaultQueryExtensionsIndex).GetMethod("IsIn")] =
+                (query, builder, dialect, expression) =>
+                {
+                    var selector = expression.Arguments[1];
+                    var predicate = expression.Arguments[2];
+
+                    var tIndex = ((LambdaExpression)((UnaryExpression)selector).Operand).Parameters[0].Type;
+                    query._queryState._bound.Add(tIndex);
+
+                    var sqlBuilder = query._dialect.CreateBuilder(query._session._store.Configuration.TablePrefix);
+
+                    // Build inner query
+                    var _builder = new StringBuilder();
+
+                    sqlBuilder.Select();
+
+                    query.ConvertFragment(_builder, ((LambdaExpression)((UnaryExpression)selector).Operand).Body);
+                    sqlBuilder.Selector(_builder.ToString());
+                    _builder.Clear();
+
+                    sqlBuilder.Table(((LambdaExpression)((UnaryExpression)selector).Operand).Parameters[0].Type.Name);
+                    query.ConvertPredicate(_builder, ((LambdaExpression)((UnaryExpression)predicate).Operand).Body);
+                    sqlBuilder.WhereAlso(_builder.ToString());
+
+                    query._queryState._bound.RemoveAt(query._queryState._bound.Count - 1);
+
+                    // Insert query
+                    query.ConvertFragment(builder, expression.Arguments[0]);
+                    builder.Append(dialect.InSelectOperator(sqlBuilder.ToSqlString()));
+                };
+
+            MethodMappings[typeof(DefaultQueryExtensionsIndex).GetMethod("IsNotIn")] =
+                (query, builder, dialect, expression) =>
+                {
+                    var selector = expression.Arguments[1];
+                    var predicate = expression.Arguments[2];
+
+                    var tIndex = ((LambdaExpression)((UnaryExpression)selector).Operand).Parameters[0].Type;
+                    query._queryState._bound.Add(tIndex);
+
+                    var sqlBuilder = query._dialect.CreateBuilder(query._session._store.Configuration.TablePrefix);
+
+                    // Build inner query
+                    var _builder = new StringBuilder();
+
+                    sqlBuilder.Select();
+
+                    query.ConvertFragment(_builder, ((LambdaExpression)((UnaryExpression)selector).Operand).Body);
+                    sqlBuilder.Selector(_builder.ToString());
+                    _builder.Clear();
+
+                    sqlBuilder.Table(query._queryState._bound.Last().Name);
+                    query.ConvertPredicate(_builder, ((LambdaExpression)((UnaryExpression)predicate).Operand).Body);
+                    sqlBuilder.WhereAlso(_builder.ToString());
+
+                    query._queryState._bound.RemoveAt(query._queryState._bound.Count - 1);
+
+                    // Insert query
+                    query.ConvertFragment(builder, expression.Arguments[0]);
+                    builder.Append(dialect.NotInSelectOperator(sqlBuilder.ToSqlString()));
+                };
         }
 
-        public DefaultQuery(IDbConnection connection, IDbTransaction transaction, Session session, string tablePrefix)
+        public DefaultQuery(DbConnection connection, DbTransaction transaction, Session session, string tablePrefix)
         {
-            _documentTable = CollectionHelper.Current.GetPrefixedName(Store.DocumentTable);
-            _connection = connection;
-            _transaction = transaction;
             _session = session;
-            _dialect = SqlDialectFactory.For(connection);
-            _sqlBuilder = _dialect.CreateBuilder(tablePrefix);
+            _dialect = session.Store.Dialect;
+            _queryState = new QueryState(_dialect.CreateBuilder(tablePrefix));
+        }
+
+        public DefaultQuery(DbConnection connection, DbTransaction transaction, Session session, string tablePrefix, QueryState queryState, object compiledQuery)
+        {
+            _queryState = queryState;
+            _compiledQuery = compiledQuery;
+            _session = session;
+            _dialect = session.Store.Dialect;
+        }
+
+        public override string ToString()
+        {
+            return _queryState._sqlBuilder.ToSqlString();
         }
 
         private void Bind<TIndex>() where TIndex : IIndex
         {
-            if (_bound.Contains(typeof(TIndex)))
+            if (_queryState._bound.Contains(typeof(TIndex)))
             {
                 return;
             }
 
             var name = typeof(TIndex).Name;
-            _bound.Add(typeof(TIndex));
+            _queryState._bound.Add(typeof(TIndex));
 
             if (typeof(MapIndex).IsAssignableFrom(typeof(TIndex)))
             {
                 // inner join [PersonByName] on [PersonByName].[Id] = [Document].[Id]
-                _sqlBuilder.InnerJoin(name, name, "DocumentId", _documentTable, "Id");
+                _queryState._sqlBuilder.InnerJoin(name, name, "DocumentId", _queryState._documentTable, "Id");
             }
             else
             {
-                var bridgeName = name + "_" + _documentTable;
+                var bridgeName = name + "_" + _queryState._documentTable;
 
                 // inner join [ArticlesByDay_Document] on [Document].[Id] = [ArticlesByDay_Document].[DocumentId]
-                _sqlBuilder.InnerJoin(bridgeName, _documentTable, "Id", bridgeName, "DocumentId");
+                _queryState._sqlBuilder.InnerJoin(bridgeName, _queryState._documentTable, "Id", bridgeName, "DocumentId");
 
                 // inner join [ArticlesByDay] on [ArticlesByDay_Document].[ArticlesByDayId] = [ArticlesByDay].[Id]
-                _sqlBuilder.InnerJoin(name, bridgeName, name + "Id", name, "Id");
+                _queryState._sqlBuilder.InnerJoin(name, bridgeName, name + "Id", name, "Id");
             }
         }
 
         private void Page(int count, int skip)
         {
-            _sqlBuilder.Skip(skip);
-            _sqlBuilder.Take(count);
+            if (skip > 0)
+            {
+                _queryState._sqlBuilder.Skip(skip.ToString());
+            }
+
+            if (count > 0)
+            {
+                _queryState._sqlBuilder.Take(count.ToString());
+            }
         }
 
         private void Filter<TIndex>(Expression<Func<TIndex, bool>> predicate) where TIndex : IIndex
         {
             // For<T> hasn't been called already
-            if (String.IsNullOrEmpty(_sqlBuilder.Clause))
+            if (String.IsNullOrEmpty(_queryState._sqlBuilder.Clause))
             {
-                _bound.Clear();
-                _bound.Add(typeof(TIndex));
+                _queryState._bound.Clear();
+                _queryState._bound.Add(typeof(TIndex));
 
-                _sqlBuilder.Select();
-                _sqlBuilder.Table(typeof(TIndex).Name);
-                _sqlBuilder.Selector(typeof(TIndex).Name, "DocumentId");
+                _queryState._sqlBuilder.Select();
+                _queryState._sqlBuilder.Table(typeof(TIndex).Name);
+                _queryState._sqlBuilder.Selector(typeof(TIndex).Name, "DocumentId");
             }
 
-            _builder.Clear();
+            _queryState._builder.Clear();
             // if Filter is called, the Document type is implicit so there is no need to filter on TIndex
-            ConvertPredicate(_builder, predicate.Body);
-            _sqlBuilder.WhereAlso(_builder.ToString());
+            ConvertPredicate(_queryState._builder, predicate.Body);
+            _queryState._sqlBuilder.WhereAlso(_queryState._builder.ToString());
         }
 
         /// <summary>
@@ -170,11 +340,16 @@ namespace YesSql.Services
             {
                 case ExpressionType.Constant:
                     return (ConstantExpression)expression;
+
+                case ExpressionType.Convert:
+                    return Evaluate(((UnaryExpression)expression).Operand);
+
                 case ExpressionType.New:
                     var newExpression = (NewExpression)expression;
                     var arguments = newExpression.Arguments.Select(a => Evaluate(a).Value).ToArray();
                     var value = newExpression.Constructor.Invoke(arguments);
                     return Expression.Constant(value);
+
                 case ExpressionType.Call:
                     var methodExpression = (MethodCallExpression)expression;
                     arguments = methodExpression.Arguments.Select(a => Evaluate(a).Value).ToArray();
@@ -193,21 +368,55 @@ namespace YesSql.Services
 
                     if (memberExpression.Member.MemberType == MemberTypes.Field)
                     {
-                        obj = Evaluate(memberExpression.Expression).Value;
-                        if (obj == null)
+                        if (memberExpression.Expression != null)
                         {
-                            return Expression.Constant(null);
+                            obj = Evaluate(memberExpression.Expression).Value;
+
+                            if (obj == null)
+                            {
+                                return Expression.Constant(null);
+                            }
                         }
+                        else
+                        {
+                            // Static members
+                            obj = null;
+                        }
+
+                        _queryState._parameterBindings = _queryState._parameterBindings ?? new List<Action<object, ISqlBuilder>>();
+
+                        // Create a delegate that will be invoked every time a compiled query is reused,
+                        // which will re-evaluate the current node, for the current parameter.
+                        var _parameterName = "@p" + _queryState._sqlBuilder.Parameters.Count.ToString();
+                        _queryState._parameterBindings.Add((o, sqlBuilder) => sqlBuilder.Parameters[_parameterName] = ((PropertyInfo)memberExpression.Member).GetValue(o));
+
                         value = ((FieldInfo)memberExpression.Member).GetValue(obj);
                         return Expression.Constant(value);
                     }
                     else if (memberExpression.Member.MemberType == MemberTypes.Property)
                     {
-                        obj = Evaluate(memberExpression.Expression).Value;
-                        if (obj == null)
+                        if (memberExpression.Expression != null)
                         {
-                            return Expression.Constant(null);
+                            obj = Evaluate(memberExpression.Expression).Value;
+
+                            if (obj == null)
+                            {
+                                return Expression.Constant(null);
+                            }
                         }
+                        else
+                        {
+                            // Static members
+                            obj = null;
+                        }
+
+                        _queryState._parameterBindings = _queryState._parameterBindings ?? new List<Action<object, ISqlBuilder>>();
+
+                        // Create a delegate that will be invoked every time a compiled query is reused,
+                        // which will re-evaluate the current node, for the current parameter.
+                        var _parameterName = "@p" + _queryState._sqlBuilder.Parameters.Count.ToString();
+                        _queryState._parameterBindings.Add((o, sqlBuilder) => sqlBuilder.Parameters[_parameterName] = ((PropertyInfo)memberExpression.Member).GetValue(o));
+
                         value = ((PropertyInfo)memberExpression.Member).GetValue(obj);
                         return Expression.Constant(value);
                     }
@@ -220,40 +429,112 @@ namespace YesSql.Services
             return Expression.Constant(Expression.Lambda(expression).Compile().DynamicInvoke());
         }
 
+        private string GetBinaryOperator(Expression expression)
+        {
+            switch (expression.NodeType)
+            {
+                case ExpressionType.LessThan:
+                    return " < ";
+                case ExpressionType.LessThanOrEqual:
+                    return " <= ";
+                case ExpressionType.GreaterThan:
+                    return " > ";
+                case ExpressionType.GreaterThanOrEqual:
+                    return " >= ";
+                case ExpressionType.And:
+                case ExpressionType.AndAlso:
+                    return " and ";
+                case ExpressionType.Or:
+                case ExpressionType.OrElse:
+                    return " or ";
+                case ExpressionType.Equal:
+                    return " = ";
+                case ExpressionType.NotEqual:
+                    return " <> ";
+                case ExpressionType.Add:
+                    return " + ";
+                case ExpressionType.Subtract:
+                    return " - ";
+                case ExpressionType.Multiply:
+                    return " * ";
+                case ExpressionType.Divide:
+                    return " / ";
+            }
+
+            throw new ArgumentException(nameof(expression));
+        }
+
         public void ConvertFragment(StringBuilder builder, Expression expression)
         {
             if (!IsParameterBased(expression))
             {
+                switch (expression.NodeType)
+                {
+                    case ExpressionType.GreaterThan:
+                    case ExpressionType.GreaterThanOrEqual:
+                    case ExpressionType.LessThan:
+                    case ExpressionType.LessThanOrEqual:
+                    case ExpressionType.And:
+                    case ExpressionType.Or:
+                    case ExpressionType.AndAlso:
+                    case ExpressionType.OrElse:
+                    case ExpressionType.Equal:
+                    case ExpressionType.NotEqual:
+                    case ExpressionType.Add:
+                    case ExpressionType.Multiply:
+                    case ExpressionType.Divide:
+                    case ExpressionType.Subtract:
+                        // Don't reduce to a single value, just render both ends
+
+                        var binaryExpression = (BinaryExpression)expression;
+                        if (binaryExpression.Left is ConstantExpression left && binaryExpression.Right is ConstantExpression right)
+                        {
+                            _queryState._builder.Append(_dialect.GetSqlValue(left.Value));
+                            _queryState._builder.Append(GetBinaryOperator(expression));
+                            _queryState._builder.Append(_dialect.GetSqlValue(right.Value));
+                            return;
+                        }
+
+                        break;
+                }
+
                 expression = Evaluate(expression);
             }
 
             switch (expression.NodeType)
             {
                 case ExpressionType.LessThan:
-                    ConvertComparisonBinaryExpression(builder, (BinaryExpression)expression, " < ");
-                    break;
                 case ExpressionType.LessThanOrEqual:
-                    ConvertComparisonBinaryExpression(builder, (BinaryExpression)expression, " <= ");
-                    break;
                 case ExpressionType.GreaterThan:
-                    ConvertComparisonBinaryExpression(builder, (BinaryExpression)expression, " > ");
-                    break;
                 case ExpressionType.GreaterThanOrEqual:
-                    ConvertComparisonBinaryExpression(builder, (BinaryExpression)expression, " >= ");
+                case ExpressionType.Equal:
+                case ExpressionType.NotEqual:
+                case ExpressionType.Subtract:
+                case ExpressionType.Multiply:
+                case ExpressionType.Divide:
+                    ConvertComparisonBinaryExpression(builder, (BinaryExpression)expression, GetBinaryOperator(expression));
                     break;
                 case ExpressionType.And:
                 case ExpressionType.AndAlso:
-                    ConvertEqualityBinaryExpression(builder, (BinaryExpression)expression, " and ");
-                    break;
                 case ExpressionType.Or:
                 case ExpressionType.OrElse:
-                    ConvertEqualityBinaryExpression(builder, (BinaryExpression)expression, " or ");
+                    ConvertEqualityBinaryExpression(builder, (BinaryExpression)expression, GetBinaryOperator(expression));
                     break;
-                case ExpressionType.Equal:
-                    ConvertComparisonBinaryExpression(builder, (BinaryExpression)expression, " = ");
+                case ExpressionType.Add:
+                    var binaryExpression = (BinaryExpression)expression;
+
+                    // Is it supposed to be a concatenation?
+                    if (binaryExpression.Left.Type == typeof(string) || binaryExpression.Right.Type == typeof(string))
+                    {
+                        ConvertConcatenateBinaryExpression(builder, binaryExpression);
+                    }
+                    else
+                    {
+                        ConvertComparisonBinaryExpression(builder, binaryExpression, " + ");
+                    }
                     break;
-                case ExpressionType.NotEqual:
-                    ConvertComparisonBinaryExpression(builder, (BinaryExpression)expression, " <> ");
+                case ExpressionType.Convert:
+                    ConvertFragment(builder, ((UnaryExpression)expression).Operand);
                     break;
                 case ExpressionType.IsTrue:
                     ConvertFragment(builder, ((UnaryExpression)expression).Operand);
@@ -267,18 +548,19 @@ namespace YesSql.Services
                     break;
                 case ExpressionType.MemberAccess:
                     var memberExpression = (MemberExpression)expression;
-                    builder.Append(_sqlBuilder.FormatColumn(_bound.Last().Name, memberExpression.Member.Name));
+                    builder.Append(_queryState._sqlBuilder.FormatColumn(_queryState._bound.Last().Name, memberExpression.Member.Name));
                     break;
                 case ExpressionType.Constant:
-                    _lastParameterName = "@p" + _sqlBuilder.Parameters.Count.ToString();
-                    _sqlBuilder.Parameters.Add(_lastParameterName, ((ConstantExpression)expression).Value);
-                    builder.Append(_lastParameterName);
+                    _queryState._lastParameterName = "@p" + _queryState._sqlBuilder.Parameters.Count.ToString();
+                    _queryState._sqlBuilder.Parameters.Add(_queryState._lastParameterName, ((ConstantExpression)expression).Value);
+                    builder.Append(_queryState._lastParameterName);
                     break;
                 case ExpressionType.Call:
                     var methodCallExpression = (MethodCallExpression)expression;
                     var methodInfo = methodCallExpression.Method;
                     Action<DefaultQuery, StringBuilder, ISqlDialect, MethodCallExpression> action;
-                    if (MethodMappings.TryGetValue(methodInfo, out action))
+                    if (MethodMappings.TryGetValue(methodInfo, out action) 
+                        || MethodMappings.TryGetValue(methodInfo.GetGenericMethodDefinition(), out action))
                     {
                         action(this, builder, _dialect, methodCallExpression);
                     }
@@ -348,6 +630,7 @@ namespace YesSql.Services
 
                     return true;
                 case ExpressionType.Not:
+                case ExpressionType.Convert:
                     return true;
                 case ExpressionType.GreaterThan:
                 case ExpressionType.GreaterThanOrEqual:
@@ -359,6 +642,10 @@ namespace YesSql.Services
                 case ExpressionType.OrElse:
                 case ExpressionType.Equal:
                 case ExpressionType.NotEqual:
+                case ExpressionType.Add:
+                case ExpressionType.Multiply:
+                case ExpressionType.Divide:
+                case ExpressionType.Subtract:
                     var binaryExpression = (BinaryExpression)expression;
                     return IsParameterBased(binaryExpression.Left) || IsParameterBased(binaryExpression.Right);
                 case ExpressionType.IsTrue:
@@ -392,11 +679,50 @@ namespace YesSql.Services
 
         private void ConvertComparisonBinaryExpression(StringBuilder builder, BinaryExpression expression, string operation)
         {
+            if (operation == " = " || operation == " <> ")
+            {
+                // Checking for NULL comparison
+                var leftIsNull = expression.Left.NodeType == ExpressionType.Constant && (expression.Left as ConstantExpression).Value == null;
+                var rightIsNull = expression.Right.NodeType == ExpressionType.Constant && (expression.Right as ConstantExpression).Value == null;
+
+                if (leftIsNull && rightIsNull)
+                {
+                    builder.Append("(");
+                    builder.Append(_dialect.GetSqlValue(true));
+                    builder.Append(operation);
+                    builder.Append(_dialect.GetSqlValue(true));
+                    builder.Append(")");
+                    return;
+                }
+                else if (leftIsNull)
+                {
+                    builder.Append("(");
+                    ConvertFragment(builder, expression.Right);
+                    builder.Append(operation == " = " ? " IS NULL" : " IS NOT NULL");
+                    builder.Append(")");
+                    return;
+                }
+                else if (rightIsNull)
+                {
+                    builder.Append("(");
+                    ConvertFragment(builder, expression.Left);
+                    builder.Append(operation == " = " ? " IS NULL" : " IS NOT NULL");
+                    builder.Append(")");
+                    return;
+                }
+
+            }
+
             builder.Append("(");
             ConvertFragment(builder, expression.Left);
             builder.Append(operation);
             ConvertFragment(builder, expression.Right);
             builder.Append(")");
+        }
+
+        private void ConvertConcatenateBinaryExpression(StringBuilder builder, BinaryExpression expression)
+        {
+            _dialect.Concat(builder, b => ConvertFragment(b, expression.Left), b => ConvertFragment(b, expression.Right));
         }
 
         private void ConvertEqualityBinaryExpression(StringBuilder builder, BinaryExpression expression, string operation)
@@ -424,54 +750,101 @@ namespace YesSql.Services
 
         private void OrderBy<T>(Expression<Func<T, object>> keySelector)
         {
-            _builder.Clear();
-            ConvertFragment(_builder, RemoveUnboxing(keySelector.Body));
-            _sqlBuilder.OrderBy(_builder.ToString());
+            _queryState._builder.Clear();
+            ConvertFragment(_queryState._builder, RemoveUnboxing(keySelector.Body));
+            _queryState._sqlBuilder.OrderBy(_queryState._builder.ToString());
         }
 
         private void ThenBy<T>(Expression<Func<T, object>> keySelector)
         {
-            _builder.Clear();
-            ConvertFragment(_builder, RemoveUnboxing(keySelector.Body));
-            _sqlBuilder.ThenOrderBy(_builder.ToString());
+            _queryState._builder.Clear();
+            ConvertFragment(_queryState._builder, RemoveUnboxing(keySelector.Body));
+            _queryState._sqlBuilder.ThenOrderBy(_queryState._builder.ToString());
         }
 
         private void OrderByDescending<T>(Expression<Func<T, object>> keySelector)
         {
-            _builder.Clear();
-            ConvertFragment(_builder, RemoveUnboxing(keySelector.Body));
-            _sqlBuilder.OrderByDescending(_builder.ToString());
+            _queryState._builder.Clear();
+            ConvertFragment(_queryState._builder, RemoveUnboxing(keySelector.Body));
+            _queryState._sqlBuilder.OrderByDescending(_queryState._builder.ToString());
         }
 
         private void ThenByDescending<T>(Expression<Func<T, object>> keySelector)
         {
-            _builder.Clear();
-            ConvertFragment(_builder, RemoveUnboxing(keySelector.Body));
-            _sqlBuilder.ThenOrderByDescending(_builder.ToString());
+            _queryState._builder.Clear();
+            ConvertFragment(_queryState._builder, RemoveUnboxing(keySelector.Body));
+            _queryState._sqlBuilder.ThenOrderByDescending(_queryState._builder.ToString());
         }
 
         public async Task<int> CountAsync()
         {
             // Commit any pending changes before doing a query (auto-flush)
-            await _session.CommitAsync();
+            await _session.FlushAsync();
 
-            _sqlBuilder.Selector("count(*)");
-            var sql = _sqlBuilder.ToSqlString(_dialect, true);
-            return await _connection.ExecuteScalarAsync<int>(sql, _sqlBuilder.Parameters, _transaction);
+            var transaction = await _session.DemandAsync();
+
+            var localBuilder = _queryState._sqlBuilder.Clone();
+
+            if (localBuilder.HasJoin)
+            {
+                localBuilder.Selector($"count(distinct {_queryState._sqlBuilder.FormatColumn(_queryState._documentTable, "Id")})");
+            }
+            else
+            {
+                localBuilder.Selector("count(*)");
+            }
+
+            // Clear paging and order when counting 
+            localBuilder.ClearOrder();
+            localBuilder.Skip(null);
+            localBuilder.Take(null);
+
+            if (_compiledQuery != null && _queryState._parameterBindings != null)
+            {
+                foreach (var binding in _queryState._parameterBindings)
+                {
+                    binding(_compiledQuery, localBuilder);
+                }
+            }
+
+            var sql = localBuilder.ToSqlString();
+            var parameters = localBuilder.Parameters;
+            var key = new WorkerQueryKey(sql, localBuilder.Parameters);
+
+            try
+            {
+                return await _session._store.ProduceAsync(key, (args) =>
+                {
+                    var localSession = (Session)args[0];
+                    var localSql = (string)args[1];
+                    var localParameters = (Dictionary<string, object>)args[2];
+                    var localTransaction = (DbTransaction)args[3];
+
+                    localSession._store.Configuration.Logger.LogDebug(localSql);
+                    return localTransaction.Connection.ExecuteScalarAsync<int>(localSql, localParameters, localTransaction);
+                }, 
+                _session, sql, parameters, transaction);
+            }
+            catch
+            {
+                _session.Cancel();
+
+                throw;
+            }
         }
 
         IQuery<T> IQuery.For<T>(bool filterType)
         {
-            _bound.Clear();
-            _bound.Add(typeof(Document));
+            _queryState._bound.Clear();
+            _queryState._bound.Add(typeof(Document));
 
-            _sqlBuilder.Select();
-            _sqlBuilder.Table(_documentTable);
+            _queryState._sqlBuilder.Select();
+            _queryState._sqlBuilder.Table(_queryState._documentTable);
 
             if (filterType)
             {
-                _sqlBuilder.WhereAlso(_sqlBuilder.FormatColumn(_documentTable, "Type") + " = @Type"); // TODO: investigate, this makes the query 3 times slower on sqlite
-                _sqlBuilder.Parameters["@Type"] = typeof(T).SimplifiedTypeName();
+                _queryState._sqlBuilder.WhereAlso(_queryState._sqlBuilder.FormatColumn(_queryState._documentTable, "Type") + " = @Type"); // TODO: investigate, this makes the query 3 times slower on sqlite
+                _queryState._sqlBuilder.Parameters["@Type"] = _session.Store.TypeNames[typeof(T)];
             }
 
             return new Query<T>(this);
@@ -479,28 +852,28 @@ namespace YesSql.Services
 
         IQueryIndex<TIndex> IQuery.ForIndex<TIndex>()
         {
-            _bound.Clear();
-            _bound.Add(typeof(TIndex));
-            _sqlBuilder.Select();
-            _sqlBuilder.Table(typeof(TIndex).Name);
+            _queryState._bound.Clear();
+            _queryState._bound.Add(typeof(TIndex));
+            _queryState._sqlBuilder.Select();
+            _queryState._sqlBuilder.Table(typeof(TIndex).Name);
 
             return new QueryIndex<TIndex>(this);
         }
 
         IQuery<object> IQuery.Any()
         {
-            _bound.Clear();
-            _bound.Add(typeof(Document));
+            _queryState._bound.Clear();
+            _queryState._bound.Add(typeof(Document));
 
-            _sqlBuilder.Select();
-            _sqlBuilder.Table(_documentTable);
-            _sqlBuilder.Selector("*");
+            _queryState._sqlBuilder.Select();
+            _queryState._sqlBuilder.Table(_queryState._documentTable);
+            _queryState._sqlBuilder.Selector("*");
             return new Query<object>(this);
         }
 
-        class Query<T> : IQuery<T> where T : class
+        public class Query<T> : IQuery<T> where T : class
         {
-            protected readonly DefaultQuery _query;
+            internal readonly DefaultQuery _query;
 
             public Query(DefaultQuery query)
             {
@@ -514,29 +887,73 @@ namespace YesSql.Services
 
             protected async Task<T> FirstOrDefaultImpl()
             {
-                // Commit any pending changes before doing a query (auto-flush)
-                await _query._session.CommitAsync();
+                // Flush any pending changes before doing a query (auto-flush)
+                await _query._session.FlushAsync();
+
+                var transaction = await _query._session.DemandAsync();
+
+                if (_query._compiledQuery != null && _query._queryState._parameterBindings != null)
+                {
+                    foreach (var binding in _query._queryState._parameterBindings)
+                    {
+                        binding(_query._compiledQuery, _query._queryState._sqlBuilder);
+                    }
+                }
 
                 _query.Page(1, 0);
 
-                if (typeof(IIndex).IsAssignableFrom(typeof(T)))
+                try
                 {
-                    _query._sqlBuilder.Selector("*");
-                    var sql = _query._sqlBuilder.ToSqlString(_query._dialect);
-                    return (await _query._connection.QueryAsync<T>(sql, _query._sqlBuilder.Parameters, _query._transaction)).FirstOrDefault();
-                }
-                else
-                {
-                    _query._sqlBuilder.Selector(_query._documentTable, "*");
-                    var sql = _query._sqlBuilder.ToSqlString(_query._dialect);
-                    var documents = (await _query._connection.QueryAsync<Document>(sql, _query._sqlBuilder.Parameters, _query._transaction)).ToArray();
-
-                    if (documents.Length == 0)
+                    if (typeof(IIndex).IsAssignableFrom(typeof(T)))
                     {
-                        return default(T);
-                    }
+                        _query._queryState._sqlBuilder.Selector("*");
+                        var sql = _query._queryState._sqlBuilder.ToSqlString();
+                        var key = new WorkerQueryKey(sql, _query._queryState._sqlBuilder.Parameters);
+                        return (await _query._session._store.ProduceAsync(key, (args) =>
+                        {
+                            var localQuery = (DefaultQuery)args[0];
+                            var localSql = (string)args[1];
+                            var localTransaction = (DbTransaction)args[2];
 
-                    return _query._session.Get<T>(documents).FirstOrDefault();
+                            localQuery._session._store.Configuration.Logger.LogDebug(localSql);
+                            return localTransaction.Connection.QueryAsync<T>(localSql, localQuery._queryState._sqlBuilder.Parameters, localTransaction);
+                        },
+                        _query,
+                        sql,
+                        transaction
+                        )).FirstOrDefault();
+                    }
+                    else
+                    {
+                        _query._queryState._sqlBuilder.Selector(_query._queryState._documentTable, "*");
+                        var sql = _query._queryState._sqlBuilder.ToSqlString();
+                        var key = new WorkerQueryKey(sql, _query._queryState._sqlBuilder.Parameters);
+                        var documents = (await _query._session._store.ProduceAsync(key, (args) =>
+                        {
+                            var localQuery = (DefaultQuery)args[0];
+                            var localSql = (string)args[1];
+                            var localTransaction = (DbTransaction)args[2];
+
+                            localQuery._session._store.Configuration.Logger.LogDebug(localSql);
+                            return localTransaction.Connection.QueryAsync<Document>(localSql, localQuery._queryState._sqlBuilder.Parameters, localTransaction);
+                        }, 
+                        _query,
+                        sql,
+                        transaction
+                        )).ToArray();
+
+                        if (documents.Length == 0)
+                        {
+                            return default(T);
+                        }
+
+                        return _query._session.Get<T>(documents).FirstOrDefault();
+                    }
+                }
+                catch
+                {
+                    _query._session.Cancel();
+                    throw;
                 }
             }
 
@@ -545,41 +962,122 @@ namespace YesSql.Services
                 return ListImpl();
             }
 
-            public async Task<IEnumerable<T>> ListImpl()
+            async IAsyncEnumerable<T> IQuery<T>.ToAsyncEnumerable()
             {
-                // Commit any pending changes before doing a query (auto-flush)
-                await _query._session.CommitAsync();
-
-                if (typeof(IIndex).IsAssignableFrom(typeof(T)))
+                // TODO: [IAsyncEnumerable] Once Dapper supports IAsyncEnumerable we can replace this call by a non-buffered one
+                foreach(var item in await ListImpl())
                 {
-                    _query._sqlBuilder.Selector("*");
-                    var sql = _query._sqlBuilder.ToSqlString(_query._dialect);
-                    return await _query._connection.QueryAsync<T>(sql, _query._sqlBuilder.Parameters, _query._transaction);
+                    yield return item;
                 }
-                else
+            }
+
+            internal async Task<IEnumerable<T>> ListImpl()
+            {
+                // TODO: [IAsyncEnumerable] Once Dapper supports IAsyncEnumerable we can return it by default, and buffer it in ListAsync instead
+
+                // Flush any pending changes before doing a query (auto-flush)
+                await _query._session.FlushAsync();
+
+                var transaction = await _query._session.DemandAsync();
+
+                if (_query._compiledQuery != null && _query._queryState._parameterBindings != null)
                 {
-                    _query._sqlBuilder.Selector(_query._sqlBuilder.FormatColumn(_query._documentTable, "*"));
-                    var sql = _query._sqlBuilder.ToSqlString(_query._dialect);
-                    var documents = await _query._connection.QueryAsync<Document>(sql, _query._sqlBuilder.Parameters, _query._transaction);
-                    return _query._session.Get<T>(documents.ToArray());
+                    foreach (var binding in _query._queryState._parameterBindings)
+                    {
+                        binding(_query._compiledQuery, _query._queryState._sqlBuilder);
+                    }
+                }
+
+                try
+                {
+                    if (typeof(IIndex).IsAssignableFrom(typeof(T)))
+                    {
+                        _query._queryState._sqlBuilder.Selector("*");
+
+                        // If a page is requested without order add a default one
+                        if (!_query._queryState._sqlBuilder.HasOrder && _query._queryState._sqlBuilder.HasPaging)
+                        {
+                            _query._queryState._sqlBuilder.OrderBy(_query._queryState._sqlBuilder.FormatColumn(typeof(T).Name, "Id"));
+                        }
+
+                        var sql = _query._queryState._sqlBuilder.ToSqlString();
+                        var key = new WorkerQueryKey(sql, _query._queryState._sqlBuilder.Parameters);
+                        return await _query._session._store.ProduceAsync(key, (args) =>
+                        {
+                            var localQuery = (DefaultQuery)args[0];
+                            var localSql = (string)args[1];
+                            var localTransaction = (DbTransaction)args[2];
+
+                            localQuery._session._store.Configuration.Logger.LogDebug(localSql);
+                            return localTransaction.Connection.QueryAsync<T>(localSql, localQuery._queryState._sqlBuilder.Parameters, localTransaction);
+                        },
+                        _query,
+                        sql,
+                        transaction
+                        );
+                    }
+                    else
+                    {
+                        // If a page is requested without order add a default one
+                        if (!_query._queryState._sqlBuilder.HasOrder && _query._queryState._sqlBuilder.HasPaging)
+                        {
+                            _query._queryState._sqlBuilder.OrderBy(_query._queryState._sqlBuilder.FormatColumn(_query._queryState._documentTable, "Id"));
+                        }
+
+                        _query._queryState._sqlBuilder.Selector(_query._queryState._sqlBuilder.FormatColumn(_query._queryState._documentTable, "*"));
+                        _query._queryState._sqlBuilder.Distinct();
+                        var sql = _query._queryState._sqlBuilder.ToSqlString();
+                        var key = new WorkerQueryKey(sql, _query._queryState._sqlBuilder.Parameters);
+                        var documents = await _query._session._store.ProduceAsync(key, (args) =>
+                        {
+                            var localQuery = (DefaultQuery)args[0];
+                            var localSql = (string)args[1];
+                            var localTransaction = (DbTransaction)args[2];
+
+                            localQuery._session._store.Configuration.Logger.LogDebug(localSql);
+                            return localTransaction.Connection.QueryAsync<Document>(localSql, localQuery._queryState._sqlBuilder.Parameters, localTransaction);
+                        },
+                        _query,
+                        sql,
+                        transaction
+                        );
+
+                        return _query._session.Get<T>(documents.ToArray());
+                    }
+                }
+                catch
+                {
+                    _query._session.Cancel();
+
+                    throw;
                 }
             }
 
             IQuery<T> IQuery<T>.Skip(int count)
             {
-                _query._sqlBuilder.Skip(count);
+                if (!_query._queryState._sqlBuilder.HasOrder)
+                {
+                    _query._queryState._sqlBuilder.OrderBy(_query._queryState._sqlBuilder.FormatColumn(_query._queryState._documentTable, "Id"));
+                }
+
+                _query._queryState._sqlBuilder.Skip(count.ToString());
                 return this;
             }
 
             IQuery<T> IQuery<T>.Take(int count)
             {
-                _query._sqlBuilder.Take(count);
+                if (!_query._queryState._sqlBuilder.HasOrder)
+                {
+                    _query._queryState._sqlBuilder.OrderBy(_query._queryState._sqlBuilder.FormatColumn(_query._queryState._documentTable, "Id"));
+                }
+
+                _query._queryState._sqlBuilder.Take(count.ToString());
                 return this;
             }
 
-            async Task<int> IQuery<T>.CountAsync()
+            Task<int> IQuery<T>.CountAsync()
             {
-                return await _query.CountAsync();
+                return _query.CountAsync();
             }
 
             IQuery<T, TIndex> IQuery<T>.With<TIndex>()
@@ -611,15 +1109,40 @@ namespace YesSql.Services
                 return ListImpl();
             }
 
+            async IAsyncEnumerable<T> IQueryIndex<T>.ToAsyncEnumerable()
+            {
+                // TODO: [IAsyncEnumerable] Once Dapper supports IAsyncEnumerable we can replace this call by a non-buffered one
+                foreach (var item in await ListImpl())
+                {
+                    yield return item;
+                }
+            }
+
             IQueryIndex<T> IQueryIndex<T>.Skip(int count)
             {
-                _query._sqlBuilder.Skip(count);
+                if (count > 0)
+                {
+                    _query._queryState._sqlBuilder.Skip(count.ToString());
+                }
+                else
+                {
+                    _query._queryState._sqlBuilder.Skip(null);
+                }
+
                 return this;
             }
 
             IQueryIndex<T> IQueryIndex<T>.Take(int count)
             {
-                _query._sqlBuilder.Take(count);
+                if (count > 0)
+                {
+                    _query._queryState._sqlBuilder.Take(count.ToString());
+                }
+                else
+                {
+                    _query._queryState._sqlBuilder.Take(null);
+                }
+
                 return this;
             }
 
@@ -643,13 +1166,13 @@ namespace YesSql.Services
 
             IQueryIndex<T> IQueryIndex<T>.Where(string sql)
             {
-                _query._sqlBuilder.WhereAlso(sql);
+                _query._queryState._sqlBuilder.WhereAlso(sql);
                 return this;
             }
 
             IQueryIndex<T> IQueryIndex<T>.Where(Func<ISqlDialect, string> sql)
             {
-                _query._sqlBuilder.WhereAlso(sql?.Invoke(_query._dialect));
+                _query._queryState._sqlBuilder.WhereAlso(sql?.Invoke(_query._dialect));
                 return this;
             }
 
@@ -685,7 +1208,7 @@ namespace YesSql.Services
 
             IQueryIndex<T> IQueryIndex<T>.WithParameter(string name, object value)
             {
-                _query._sqlBuilder.Parameters[name] = value;
+                _query._queryState._sqlBuilder.Parameters[name] = value;
                 return this;
             }
         }
@@ -701,19 +1224,19 @@ namespace YesSql.Services
 
             IQuery<T, TIndex> IQuery<T, TIndex>.Where(string sql)
             {
-                _query._sqlBuilder.WhereAlso(sql);
+                _query._queryState._sqlBuilder.WhereAlso(sql);
                 return this;
             }
 
             IQuery<T, TIndex> IQuery<T, TIndex>.Where(Func<ISqlDialect, string> sql)
             {
-                _query._sqlBuilder.WhereAlso(sql?.Invoke(_query._dialect));
+                _query._queryState._sqlBuilder.WhereAlso(sql?.Invoke(_query._dialect));
                 return this;
             }
 
             IQuery<T, TIndex> IQuery<T, TIndex>.WithParameter(string name, object value)
             {
-                _query._sqlBuilder.Parameters[name] = value;
+                _query._queryState._sqlBuilder.Parameters[name] = value;
                 return this;
             }
 
@@ -729,9 +1252,21 @@ namespace YesSql.Services
                 return this;
             }
 
+            IQuery<T, TIndex> IQuery<T, TIndex>.OrderBy(string sql)
+            {
+                _query._queryState._sqlBuilder.OrderBy(sql);
+                return this;
+            }
+
             IQuery<T, TIndex> IQuery<T, TIndex>.ThenBy(Expression<Func<TIndex, object>> keySelector)
             {
                 _query.ThenBy(keySelector);
+                return this;
+            }
+
+            IQuery<T, TIndex> IQuery<T, TIndex>.ThenBy(string sql)
+            {
+                _query._queryState._sqlBuilder.ThenOrderBy(sql);
                 return this;
             }
 
@@ -741,9 +1276,21 @@ namespace YesSql.Services
                 return this;
             }
 
+            IQuery<T, TIndex> IQuery<T, TIndex>.OrderByDescending(string sql)
+            {
+                _query._queryState._sqlBuilder.OrderByDescending(sql);
+                return this;
+            }
+
             IQuery<T, TIndex> IQuery<T, TIndex>.ThenByDescending(Expression<Func<TIndex, object>> keySelector)
             {
                 _query.ThenByDescending(keySelector);
+                return this;
+            }
+
+            IQuery<T, TIndex> IQuery<T, TIndex>.ThenByDescending(string sql)
+            {
+                _query._queryState._sqlBuilder.ThenOrderByDescending(sql);
                 return this;
             }
         }
@@ -751,14 +1298,27 @@ namespace YesSql.Services
 
     public static class DefaultQueryExtensions
     {
-        public static bool IsIn(this string source, IEnumerable<string> values)
+        public static bool IsIn(this object source, IEnumerable values)
         {
             return false;
         }
-        public static bool IsIn(this int source, IEnumerable<int> values)
+
+        public static bool IsNotIn(this object source, IEnumerable values)
         {
             return false;
         }
     }
 
+    public static class DefaultQueryExtensionsIndex
+    {
+        public static bool IsIn<TIndex>(this object source, Expression<Func<TIndex, object>> select, Expression<Func<TIndex, bool>> where)
+        {
+            return false;
+        }
+
+        public static bool IsNotIn<TIndex>(this object source, Expression<Func<TIndex, object>> select, Expression<Func<TIndex, bool>> where)
+        {
+            return false;
+        }
+    }
 }

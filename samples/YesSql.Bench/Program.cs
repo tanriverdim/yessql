@@ -1,5 +1,4 @@
 using System.Threading.Tasks;
-using Xunit;
 using YesSql;
 using YesSql.Indexes;
 using YesSql.Provider.SqlServer;
@@ -16,31 +15,34 @@ namespace Bench
 
         static async Task MainAsync(string[] args)
         {
-            var store = new Store(
-                new Configuration()
+            var configuration = new Configuration()
                     .UseSqlServer(@"Data Source =.; Initial Catalog = yessql; Integrated Security = True")
-                    .SetTablePrefix("Bench")
-                );
+                    .SetTablePrefix("Bench");
 
-            await store.InitializeAsync();
-
-            using (var session = store.CreateSession())
+            using (var connection = configuration.ConnectionFactory.CreateConnection())
             {
-                var builder = new SchemaBuilder(session);
+                await connection.OpenAsync();
 
-                builder.CreateMapIndexTable(nameof(UserByName), c => c
-                    .Column<string>("Name")
-                    .Column<bool>("Adult")
-                    .Column<int>("Age")
-                );
+                using (var transaction = connection.BeginTransaction(configuration.IsolationLevel))
+                {
+                    var builder = new SchemaBuilder(configuration, transaction);
+
+                    builder.CreateMapIndexTable(nameof(UserByName), c => c
+                        .Column<string>("Name")
+                        .Column<bool>("Adult")
+                        .Column<int>("Age")
+                    );
+
+                    transaction.Commit();
+                }
             }
 
+            var store = await StoreFactory.CreateAsync(configuration);
             store.RegisterIndexes<UserIndexProvider>();
 
             using (var session = store.CreateSession())
             {
                 var user = await session.Query<User>().FirstOrDefaultAsync();
-                Assert.Null(user);
 
                 var bill = new User
                 {
@@ -57,16 +59,12 @@ namespace Bench
             using (var session = store.CreateSession())
             {
                 var user = await session.Query<User, UserByName>().Where(x => x.Adult == true).FirstOrDefaultAsync();
-                Assert.NotNull(user);
 
                 user = await session.Query<User, UserByName>().Where(x => x.Age == 1).FirstOrDefaultAsync();
-                Assert.NotNull(user);
 
                 user = await session.Query<User, UserByName>().Where(x => x.Age == 1 && x.Adult).FirstOrDefaultAsync();
-                Assert.NotNull(user);
 
                 user = await session.Query<User, UserByName>().Where(x => x.Name.StartsWith("B")).FirstOrDefaultAsync();
-                Assert.NotNull(user);
             }
         }
     }

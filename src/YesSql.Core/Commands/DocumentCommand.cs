@@ -1,8 +1,7 @@
-﻿using System.Data;
+using Microsoft.Extensions.Logging;
+using System.Data.Common;
 using System.Reflection;
 using System.Threading.Tasks;
-using YesSql.Indexes;
-using YesSql.Sql;
 
 namespace YesSql.Commands
 {
@@ -27,6 +26,6 @@ namespace YesSql.Commands
 
         public Document Document { get; }
 
-        public abstract Task ExecuteAsync(IDbConnection connection, IDbTransaction transaction, ISqlDialect dialect);
+        public abstract Task ExecuteAsync(DbConnection connection, DbTransaction transaction, ISqlDialect dialect, ILogger logger);
     }
 }

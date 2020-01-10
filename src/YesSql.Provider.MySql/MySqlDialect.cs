@@ -1,7 +1,8 @@
-﻿using System;
+using MySql.Data.MySqlClient;
+using System;
 using System.Collections.Generic;
 using System.Data;
-using YesSql.Sql;
+using System.Text;
 
 namespace YesSql.Provider.MySql
 {
@@ -10,7 +11,7 @@ namespace YesSql.Provider.MySql
         private static Dictionary<DbType, string> ColumnTypes = new Dictionary<DbType, string>
         {
             {DbType.Guid, "char(36)"},
-            {DbType.Binary, "varbinary"},
+            {DbType.Binary, "varbinary(8000)"},
             {DbType.Time, "time"},
             {DbType.Date, "datetime"},
             {DbType.DateTime, "datetime" },
@@ -37,30 +38,44 @@ namespace YesSql.Provider.MySql
         public override string IdentityColumnString => "int AUTO_INCREMENT primary key";
         public override bool SupportsIfExistsBeforeTableName => true;
 
-        public override ISqlBuilder CreateBuilder(string tablePrefix)
-        {
-            return new MySqlSqlBuilder(tablePrefix, this);
-        }
-
         public override string GetTypeName(DbType dbType, int? length, byte precision, byte scale)
         {
             if (length.HasValue)
             {
+                if (dbType == DbType.Binary)
+                {
+                    if (length < 256)
+                    {
+                        return "TINYBLOB";
+                    }
+
+                    if (length < 65536)
+                    {
+                        return "BLOB";
+                    }
+
+                    if (length < 16777216)
+                    {
+                        return "MEDIUMBLOB";
+                    }
+
+                    return "LONGBLOB";
+                }
+
                 if (length.Value > 4000)
                 {
                     if (dbType == DbType.String)
                     {
-                        return "TEXT";
+                        // Mysql uses up to 4 bytes per Unicode char depends on Encoding, so 65536/4 and 16MB/4 make sense
+                        return length.Value > 16384 ?
+                            length.Value > 4194304 ? "LONGTEXT" : "MEDIUMTEXT" : "TEXT";
                     }
 
                     if (dbType == DbType.AnsiString)
                     {
-                        return "TEXT";
-                    }
-
-                    if (dbType == DbType.Binary)
-                    {
-                        return "BLOB";
+                        // Mysql uses up to 4 bytes per Unicode char depends on Encoding, so 65536/4 and 16MB/4 make sense
+                        return length.Value > 16384 ?
+                            length.Value > 4194304 ? "LONGTEXT" : "MEDIUMTEXT" : "TEXT";
                     }
                 }
                 else
@@ -73,11 +88,6 @@ namespace YesSql.Provider.MySql
                     if (dbType == DbType.AnsiString)
                     {
                         return "varchar(" + length + ")";
-                    }
-
-                    if (dbType == DbType.Binary)
-                    {
-                        return "varbinary(" + length + ")";
                     }
                 }
             }
@@ -95,21 +105,46 @@ namespace YesSql.Provider.MySql
             return " drop foreign key " + name;
         }
 
+        public override string GetAddForeignKeyConstraintString(string name, string[] srcColumns, string destTable, string[] destColumns, bool primaryKey)
+        {
+            string sql = base.GetAddForeignKeyConstraintString(name, srcColumns, destTable, destColumns, primaryKey);
+
+            var res = new StringBuilder(sql);
+
+            res.Append(" on delete cascade ")
+                .Append(" on update cascade ");
+
+            return res.ToString();
+        }
+
         public override string DefaultValuesInsert => "VALUES()";
 
-        public override void Page(ISqlBuilder sqlBuilder, int offset, int limit)
+        public override void Page(ISqlBuilder sqlBuilder, string offset, string limit)
         {
-            if (offset == 0 && limit != 0)
+            if (offset != null && limit == null)
             {
-                // Insert LIMIT clause after the select
-                var selector = sqlBuilder.GetSelector();
-                selector = " " + selector + " limit " + limit;
-                sqlBuilder.Selector(selector);
+                limit = "-1";
             }
-            else if (offset != 0 || limit != 0)
+
+            if (limit != null)
             {
-                sqlBuilder.Trail = "OFFSET " + offset + " ROWS FETCH FIRST " + limit + " ROWS ONLY";
+                sqlBuilder.Trail(" LIMIT ");
+
+                // c.f. https://stackoverflow.com/questions/255517/mysql-offset-infinite-rows
+                sqlBuilder.Trail(limit == "-1" ? "18446744073709551610" : limit);
+
+                if (offset != null)
+                {
+                    sqlBuilder.Trail(" OFFSET ");
+                    sqlBuilder.Trail(offset);
+                }
             }
+        }
+
+        public override string GetDropIndexString(string indexName, string tableName)
+        {
+            // This is dependent on version of MySql < v10.1.4 does not support IF EXISTS
+            return "drop index " + QuoteForColumnName(indexName) + " on " + QuoteForTableName(tableName);
         }
 
         public override string QuoteForColumnName(string columnName)
@@ -122,9 +157,21 @@ namespace YesSql.Provider.MySql
             return "`" + tableName + "`";
         }
 
-        protected override string Quote(string value)
+        public override void Concat(StringBuilder builder, params Action<StringBuilder>[] generators)
         {
-            return QuoteString + value.Replace(QuoteString, DoubleQuoteString) + QuoteString;
+            builder.Append("concat(");
+
+            for (var i = 0; i < generators.Length; i++)
+            {
+                if (i > 0)
+                {
+                    builder.Append(", ");
+                }
+
+                generators[i](builder);
+            }
+
+            builder.Append(")");
         }
     }
 }

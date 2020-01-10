@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Linq;
 using System.Text;
 using YesSql.Sql;
 
@@ -11,7 +12,7 @@ namespace YesSql.Provider.PostgreSql
         private static Dictionary<DbType, string> ColumnTypes = new Dictionary<DbType, string>
         {
             {DbType.Guid, "char(36)"},
-            {DbType.Binary, "varbinary"},
+            {DbType.Binary, "bytea"},
             {DbType.Date, "date"},
             {DbType.Time, "time"},
             {DbType.DateTime, "timestamp" },
@@ -47,14 +48,11 @@ namespace YesSql.Provider.PostgreSql
 
         public override string Name => "PostgreSql";
         public override string InOperator(string values) => " = any(array[" + values + "])";
-        public override string IdentitySelectString => "RETURNING ";
+        public override string NotInOperator(string values) => " <> all(array[" + values + "])";
+        public override string IdentitySelectString => "RETURNING";
         public override string IdentityColumnString => "SERIAL PRIMARY KEY";
         public override bool SupportsIfExistsBeforeTableName => true;
-
-        public override ISqlBuilder CreateBuilder(string tablePrefix)
-        {
-            return new PostgreSqlSqlBuilder(tablePrefix, this);
-        }
+        public override bool PrefixIndex => true;
 
         public override string GetTypeName(DbType dbType, int? length, byte precision, byte scale)
         {
@@ -71,11 +69,6 @@ namespace YesSql.Provider.PostgreSql
                     {
                         return "text";
                     }
-
-                    if (dbType == DbType.Binary)
-                    {
-                        return "bytea";
-                    }
                 }
                 else
                 {
@@ -87,11 +80,6 @@ namespace YesSql.Provider.PostgreSql
                     if (dbType == DbType.AnsiString)
                     {
                         return "varchar(" + length + ")";
-                    }
-
-                    if (dbType == DbType.Binary)
-                    {
-                        return "bytea";
                     }
                 }
             }
@@ -111,24 +99,30 @@ namespace YesSql.Provider.PostgreSql
 
         public override string DefaultValuesInsert => "DEFAULT VALUES";
 
-        public override void Page(ISqlBuilder sqlBuilder, int offset, int limit)
+        public override void Page(ISqlBuilder sqlBuilder, string offset, string limit)
         {
-            var sb = new StringBuilder();
+            sqlBuilder.Trail(" limit ");
 
-            sb.Append(" limit ");
-
-            if (limit != 0)
+            if (offset != null && limit == null)
             {
-                sb.Append(limit);
+                sqlBuilder.Trail(" all");
             }
 
-            if (offset != 0)
+            if (limit != null)
             {
-                sb.Append(" offset ");
-                sb.Append(offset);
+                sqlBuilder.Trail(limit);
             }
 
-            sqlBuilder.Trail = sb.ToString();
+            if (offset != null)
+            {
+                sqlBuilder.Trail(" offset ");
+                sqlBuilder.Trail(offset);
+            }
+        }
+
+        public override string GetDropIndexString(string indexName, string tableName)
+        {
+            return "drop index if exists " + QuoteForColumnName(indexName);
         }
 
         public override string QuoteForColumnName(string columnName)
@@ -139,11 +133,6 @@ namespace YesSql.Provider.PostgreSql
         public override string QuoteForTableName(string tableName)
         {
             return QuoteString + tableName + QuoteString;
-        }
-
-        protected override string Quote(string value)
-        {
-            return SingleQuoteString + value.Replace(SingleQuoteString, DoubleSingleQuoteString) + SingleQuoteString;
         }
 
         public override string CascadeConstraintsString => " cascade ";
@@ -163,6 +152,5 @@ namespace YesSql.Provider.PostgreSql
                     return base.GetSqlValue(value);
             }
         }
-
     }
 }
